@@ -1,0 +1,341 @@
+name: Release binaries
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Exact existing published release tag
+        required: true
+        type: string
+  # One-time backfill request, not a general push-to-release trigger.
+  push:
+    branches: [main]
+    paths: [.github/release-backfill/0.1.0.request]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.release.tag_name || inputs.tag || '0.1.0' }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      commit: ${{ steps.resolve.outputs.commit }}
+      tooling: ${{ steps.resolve.outputs.tooling }}
+      release_id: ${{ steps.resolve.outputs.release_id }}
+      immutable: ${{ steps.resolve.outputs.immutable }}
+    steps:
+      - name: Check out trusted release tooling
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'push' && github.sha || github.event.repository.default_branch }}
+          path: tooling
+          persist-credentials: false
+      - name: Resolve the published release and exact tag commit
+        id: resolve
+        working-directory: tooling
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          REQUESTED_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT" == push ]]; then
+            printf 'tag=0.1.0\ncommit=e211d99af23681f4ba4b8953c1a1bc047dacd2c7\n' > "$RUNNER_TEMP/expected-request"
+            cmp .github/release-backfill/0.1.0.request "$RUNNER_TEMP/expected-request"
+            tag=0.1.0
+          else
+            tag="$REQUESTED_TAG"
+          fi
+          # Match the release helper's safe semantic-version tag grammar.
+          version_pattern='^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'
+          [[ "$tag" =~ $version_pattern ]] || { echo 'Invalid tag' >&2; exit 1; }
+          release=$(gh api "repos/$GH_REPO/releases/tags/$tag")
+          jq -e --arg tag "$tag" '.tag_name == $tag and .draft == false and (.id | type == "number") and (.immutable | type == "boolean")' <<< "$release" > /dev/null
+          release_id=$(jq -r '.id' <<< "$release")
+          immutable=$(jq -r '.immutable' <<< "$release")
+          if [[ "$tag" == 0.1.0 ]]; then
+            [[ "$release_id" == 427921630 ]] || { echo '0.1.0 release ID changed' >&2; exit 1; }
+          fi
+          git fetch --no-tags origin "refs/tags/$tag"
+          commit=$(git rev-parse 'FETCH_HEAD^{commit}')
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          if [[ "$tag" == 0.1.0 ]]; then
+            [[ "$commit" == e211d99af23681f4ba4b8953c1a1bc047dacd2c7 ]] || { echo '0.1.0 tag does not point to expected commit' >&2; exit 1; }
+          fi
+          printf 'tag=%s\ncommit=%s\ntooling=%s\nrelease_id=%s\nimmutable=%s\n' "$tag" "$commit" "$(git rev-parse HEAD)" "$release_id" "$immutable" >> "$GITHUB_OUTPUT"
+
+  tooling-tests:
+    needs: resolve
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.tooling }}
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - name: Test release tooling
+        env:
+          GOTOOLCHAIN: local
+        run: |
+          test "$(go env GOVERSION)" = go1.27.3
+          python3 tests/test_release.py
+
+  build_linux_amd64:
+    needs: [resolve, tooling-tests]
+    runs-on: ubuntu-24.04
+    outputs:
+      sha256: ${{ steps.freeze.outputs.sha256 }}
+    steps:
+      - name: Check out trusted release tooling
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.tooling }}
+          path: tooling
+          persist-credentials: false
+      - name: Check out immutable tagged source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+          path: source
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - name: Test and package once on the target platform
+        id: freeze
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+          COMMIT: ${{ needs.resolve.outputs.commit }}
+          TARGET_OS: linux
+          TARGET_ARCH: amd64
+          GOTOOLCHAIN: local
+        run: |
+          set -euo pipefail
+          test "$(go env GOVERSION)" = go1.27.3
+          test "$(go env GOHOSTOS)" = "$TARGET_OS"
+          test "$(go env GOHOSTARCH)" = "$TARGET_ARCH"
+          (cd source && go test ./...)
+          bash tooling/scripts/release.sh build source "$RUNNER_TEMP/dist" "$TAG" "$TARGET_OS" "$TARGET_ARCH" "$COMMIT"
+          bash tooling/scripts/release.sh verify "$RUNNER_TEMP/dist" "$TAG" "$TARGET_OS" "$TARGET_ARCH" "$COMMIT"
+          mkdir "$RUNNER_TEMP/frozen"
+          tar -xzf "$RUNNER_TEMP/dist/docker-registry-cleaner_${TAG}_${TARGET_OS}_${TARGET_ARCH}.tar.gz" -C "$RUNNER_TEMP/frozen"
+          "$RUNNER_TEMP/frozen/registry-cleaner" --help
+          # Exercise the exact packaged binary against a disposable registry natively.
+          GOBIN="$RUNNER_TEMP" go install github.com/distribution/distribution/v3/cmd/registry@v3.0.0
+          (cd source && CLEANER_BIN="$RUNNER_TEMP/frozen/registry-cleaner" DISTRIBUTION_BIN="$RUNNER_TEMP/registry" go test -count=1 -v ./integration)
+          # Export the digest independently of the artifact download.
+          digest=$(shasum -a 256 "$RUNNER_TEMP/dist/docker-registry-cleaner_${TAG}_${TARGET_OS}_${TARGET_ARCH}.tar.gz" | cut -d ' ' -f1)
+          printf 'sha256=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-amd64
+          path: ${{ runner.temp }}/dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  build_linux_arm64:
+    needs: [resolve, tooling-tests]
+    runs-on: ubuntu-24.04-arm
+    outputs:
+      sha256: ${{ steps.freeze.outputs.sha256 }}
+    steps:
+      - name: Check out trusted release tooling
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.tooling }}
+          path: tooling
+          persist-credentials: false
+      - name: Check out immutable tagged source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+          path: source
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - name: Test and package once on the target platform
+        id: freeze
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+          COMMIT: ${{ needs.resolve.outputs.commit }}
+          TARGET_OS: linux
+          TARGET_ARCH: arm64
+          GOTOOLCHAIN: local
+        run: |
+          set -euo pipefail
+          test "$(go env GOVERSION)" = go1.27.3
+          test "$(go env GOHOSTOS)" = "$TARGET_OS"
+          test "$(go env GOHOSTARCH)" = "$TARGET_ARCH"
+          (cd source && go test ./...)
+          bash tooling/scripts/release.sh build source "$RUNNER_TEMP/dist" "$TAG" "$TARGET_OS" "$TARGET_ARCH" "$COMMIT"
+          bash tooling/scripts/release.sh verify "$RUNNER_TEMP/dist" "$TAG" "$TARGET_OS" "$TARGET_ARCH" "$COMMIT"
+          mkdir "$RUNNER_TEMP/frozen"
+          tar -xzf "$RUNNER_TEMP/dist/docker-registry-cleaner_${TAG}_${TARGET_OS}_${TARGET_ARCH}.tar.gz" -C "$RUNNER_TEMP/frozen"
+          "$RUNNER_TEMP/frozen/registry-cleaner" --help
+          # Exercise the exact packaged binary against a disposable registry natively.
+          GOBIN="$RUNNER_TEMP" go install github.com/distribution/distribution/v3/cmd/registry@v3.0.0
+          (cd source && CLEANER_BIN="$RUNNER_TEMP/frozen/registry-cleaner" DISTRIBUTION_BIN="$RUNNER_TEMP/registry" go test -count=1 -v ./integration)
+          # Export the digest independently of the artifact download.
+          digest=$(shasum -a 256 "$RUNNER_TEMP/dist/docker-registry-cleaner_${TAG}_${TARGET_OS}_${TARGET_ARCH}.tar.gz" | cut -d ' ' -f1)
+          printf 'sha256=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-arm64
+          path: ${{ runner.temp }}/dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  build_darwin_arm64:
+    needs: [resolve, tooling-tests]
+    runs-on: macos-14
+    outputs:
+      sha256: ${{ steps.freeze.outputs.sha256 }}
+    steps:
+      - name: Check out trusted release tooling
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.tooling }}
+          path: tooling
+          persist-credentials: false
+      - name: Check out immutable tagged source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+          path: source
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - name: Test and package once on the target platform
+        id: freeze
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+          COMMIT: ${{ needs.resolve.outputs.commit }}
+          TARGET_OS: darwin
+          TARGET_ARCH: arm64
+          GOTOOLCHAIN: local
+        run: |
+          set -euo pipefail
+          test "$(go env GOVERSION)" = go1.27.3
+          test "$(go env GOHOSTOS)" = "$TARGET_OS"
+          test "$(go env GOHOSTARCH)" = "$TARGET_ARCH"
+          (cd source && go test ./...)
+          bash tooling/scripts/release.sh build source "$RUNNER_TEMP/dist" "$TAG" "$TARGET_OS" "$TARGET_ARCH" "$COMMIT"
+          bash tooling/scripts/release.sh verify "$RUNNER_TEMP/dist" "$TAG" "$TARGET_OS" "$TARGET_ARCH" "$COMMIT"
+          mkdir "$RUNNER_TEMP/frozen"
+          tar -xzf "$RUNNER_TEMP/dist/docker-registry-cleaner_${TAG}_${TARGET_OS}_${TARGET_ARCH}.tar.gz" -C "$RUNNER_TEMP/frozen"
+          "$RUNNER_TEMP/frozen/registry-cleaner" --help
+          # Exercise the exact packaged binary against a disposable registry natively.
+          GOBIN="$RUNNER_TEMP" go install github.com/distribution/distribution/v3/cmd/registry@v3.0.0
+          (cd source && CLEANER_BIN="$RUNNER_TEMP/frozen/registry-cleaner" DISTRIBUTION_BIN="$RUNNER_TEMP/registry" go test -count=1 -v ./integration)
+          # Export the digest independently of the artifact download.
+          digest=$(shasum -a 256 "$RUNNER_TEMP/dist/docker-registry-cleaner_${TAG}_${TARGET_OS}_${TARGET_ARCH}.tar.gz" | cut -d ' ' -f1)
+          printf 'sha256=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-darwin-arm64
+          path: ${{ runner.temp }}/dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  upload:
+    needs: [resolve, build_linux_amd64, build_linux_arm64, build_darwin_arm64]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the same trusted release tooling
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.tooling }}
+          path: tooling
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Verify, checksum and upload without replacing assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          COMMIT: ${{ needs.resolve.outputs.commit }}
+          RELEASE_ID: ${{ needs.resolve.outputs.release_id }}
+          IMMUTABLE: ${{ needs.resolve.outputs.immutable }}
+          SHA_LINUX_AMD64: ${{ needs.build_linux_amd64.outputs.sha256 }}
+          SHA_LINUX_ARM64: ${{ needs.build_linux_arm64.outputs.sha256 }}
+          SHA_DARWIN_ARM64: ${{ needs.build_darwin_arm64.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          for target in linux_amd64 linux_arm64 darwin_arm64; do
+            case "$target" in
+              linux_amd64) expected="$SHA_LINUX_AMD64" ;;
+              linux_arm64) expected="$SHA_LINUX_ARM64" ;;
+              darwin_arm64) expected="$SHA_DARWIN_ARM64" ;;
+            esac
+            [[ "$expected" =~ ^[0-9a-f]{64}$ ]]
+            actual=$(sha256sum "dist/docker-registry-cleaner_${TAG}_${target}.tar.gz" | cut -d ' ' -f1)
+            test "$actual" = "$expected"
+          done
+          bash tooling/scripts/release.sh checksums dist "$TAG" "$COMMIT"
+          bash tooling/scripts/release.sh verify-checksums dist "$TAG" "$COMMIT"
+          # Abort if the tag or release changed while the binaries were built.
+          git -C tooling fetch --no-tags origin "refs/tags/$TAG"
+          test "$(git -C tooling rev-parse 'FETCH_HEAD^{commit}')" = "$COMMIT"
+          release=$(gh api "repos/$GH_REPO/releases/tags/$TAG")
+          jq -e --arg tag "$TAG" --arg id "$RELEASE_ID" --arg immutable "$IMMUTABLE" \
+            '.tag_name == $tag and .draft == false and (.id | tostring) == $id and (.immutable | tostring) == $immutable' <<< "$release" > /dev/null
+          files=("docker-registry-cleaner_${TAG}_linux_amd64.tar.gz" "docker-registry-cleaner_${TAG}_linux_arm64.tar.gz" "docker-registry-cleaner_${TAG}_darwin_arm64.tar.gz" SHA256SUMS)
+          mkdir "$RUNNER_TEMP/existing"
+          # Preflight every named asset before uploading any. Never use --clobber.
+          for file in "${files[@]}"; do
+            if jq -e --arg name "$file" '.assets | any(.name == $name)' <<< "$release" > /dev/null; then
+              gh release download "$TAG" --pattern "$file" --dir "$RUNNER_TEMP/existing"
+              cmp "dist/$file" "$RUNNER_TEMP/existing/$file" || { echo "Existing asset differs: $file" >&2; exit 1; }
+            fi
+          done
+          for file in "${files[@]}"; do
+            if ! jq -e --arg name "$file" '.assets | any(.name == $name)' <<< "$release" > /dev/null; then
+              [[ "$IMMUTABLE" == false ]] || { echo 'Release is immutable and asset is missing' >&2; exit 1; }
+              gh api "repos/$GH_REPO/releases/tags/$TAG" | jq -e --arg id "$RELEASE_ID" --arg immutable "$IMMUTABLE" \
+                '(.id | tostring) == $id and .draft == false and (.immutable | tostring) == $immutable' > /dev/null
+              # Upload to the pinned release ID, not a tag that could be recreated.
+              gh api --method POST -H 'Content-Type: application/octet-stream' \
+                --input "dist/$file" "https://uploads.github.com/repos/$GH_REPO/releases/$RELEASE_ID/assets?name=$file" > /dev/null
+            fi
+          done
+          # Verify the bytes actually attached to the release, not just local files.
+          mkdir "$RUNNER_TEMP/published"
+          for file in "${files[@]}"; do
+            gh release download "$TAG" --pattern "$file" --dir "$RUNNER_TEMP/published"
+            cmp "dist/$file" "$RUNNER_TEMP/published/$file"
+          done
+          bash tooling/scripts/release.sh verify-checksums "$RUNNER_TEMP/published" "$TAG" "$COMMIT"
+          # Also check GitHub's server-reported SHA-256 for each uploaded asset.
+          api_release=$(gh api "repos/$GH_REPO/releases/tags/$TAG")
+          jq -e --arg tag "$TAG" --arg id "$RELEASE_ID" --arg immutable "$IMMUTABLE" \
+            '.tag_name == $tag and .draft == false and (.id | tostring) == $id and (.immutable | tostring) == $immutable' <<< "$api_release" > /dev/null
+          for file in "${files[@]}"; do
+            digest="sha256:$(sha256sum "dist/$file" | cut -d ' ' -f1)"
+            jq -e --arg name "$file" --arg digest "$digest" \
+              '[.assets[] | select(.name == $name and .state == "uploaded" and .digest == $digest)] | length == 1' \
+              <<< "$api_release" > /dev/null || { echo "GitHub digest missing or mismatched: $file" >&2; exit 1; }
+          done
+          git -C tooling fetch --no-tags origin "refs/tags/$TAG"
+          test "$(git -C tooling rev-parse 'FETCH_HEAD^{commit}')" = "$COMMIT"

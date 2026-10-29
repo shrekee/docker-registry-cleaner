@@ -14,6 +14,8 @@
 
 ## 安装与使用
 
+可从 GitHub Release 下载 Linux amd64、Linux arm64 和 macOS arm64 二进制归档；校验方法及发布流程见 [二进制发布说明](https://github.com/shrekee/docker-registry-cleaner/blob/main/docs/releases.md)。
+
 需要 Go 1.26 或更新版本；依赖版本在 `go.mod`/`go.sum` 中锁定。源码构建：
 
 ```sh
