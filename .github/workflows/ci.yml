@@ -1,0 +1,51 @@
+name: Go checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go test -race ./...
+      - run: go vet ./...
+      - run: go build -o "$RUNNER_TEMP/registry-cleaner" ./cmd/registry-cleaner
+      - run: '"$RUNNER_TEMP/registry-cleaner" --help'
+      - name: Build disposable Distribution v3.0.0
+        run: GOBIN="$RUNNER_TEMP" go install github.com/distribution/distribution/v3/cmd/registry@v3.0.0
+      - name: Test exact binary with disposable Distribution
+        env:
+          CLEANER_BIN: ${{ runner.temp }}/registry-cleaner
+          DISTRIBUTION_BIN: ${{ runner.temp }}/registry
+        run: go test -count=1 -v ./integration
+      - name: Exercise fallback, uncertainty, stale and pagination cases
+        env:
+          CLEANER_BIN: ${{ runner.temp }}/registry-cleaner
+          DISTRIBUTION_BIN: ${{ runner.temp }}/registry
+        run: |
+          INTEGRATION_FORCE_405=1 go test -count=1 -v ./integration
+          INTEGRATION_FORCE_405=1 INTEGRATION_FAIL_FALLBACK=1 go test -count=1 -v ./integration
+          INTEGRATION_DROP_DELETE=1 go test -count=1 -v ./integration
+          INTEGRATION_STALE=1 go test -count=1 -v ./integration
+          INTEGRATION_PAGE_FAIL=1 go test -count=1 -v ./integration
+          INTEGRATION_NOOP_202=1 go test -count=1 -v ./integration
+      - name: Build disposable Distribution v2.8.3
+        run: |
+          git clone --depth 1 --branch v2.8.3 https://github.com/distribution/distribution.git "$RUNNER_TEMP/distribution-v2-src"
+          test "$(git -C "$RUNNER_TEMP/distribution-v2-src" rev-parse HEAD)" = 4772604ae973031ab32dd9805a4bccf61d94909f
+          mkdir -p "$RUNNER_TEMP/dist-v2-gopath/src/github.com/docker"
+          ln -s "$RUNNER_TEMP/distribution-v2-src" "$RUNNER_TEMP/dist-v2-gopath/src/github.com/docker/distribution"
+          GO111MODULE=off GOPATH="$RUNNER_TEMP/dist-v2-gopath" go build -o "$RUNNER_TEMP/registry-v2" github.com/docker/distribution/cmd/registry
+      - name: Exercise v2 rejection and explicit compatibility
+        env:
+          CLEANER_BIN: ${{ runner.temp }}/registry-cleaner
+          DISTRIBUTION_BIN: ${{ runner.temp }}/registry-v2
+        run: |
+          INTEGRATION_EXPECT_REJECT=1 go test -count=1 -v ./integration
+          INTEGRATION_V2_ENABLE=1 go test -count=1 -v ./integration
